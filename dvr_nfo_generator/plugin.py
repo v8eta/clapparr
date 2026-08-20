@@ -21,9 +21,18 @@ TIMING -- why this defers to a thread
 The `recording_end` event fires from inside `run_recording`, BEFORE that same
 task remuxes the .ts into its final .mkv and writes `file_path` onto the
 Recording. Blocking the handler until the file appears would therefore deadlock
-the very task that produces it. The handler instead hands off to a daemon thread
-which waits for `status == completed` (or the file to appear on disk) and then
-writes the sidecars. The handler itself returns immediately.
+the very task that produces it.
+
+Dispatcharr's own plugin documentation confirms the mechanism: actions with an
+`events` list are dispatched from `log_system_event()` "on a separate gevent
+when uWSGI has an active hub (otherwise synchronously, e.g. Celery)". Recording
+runs on a Celery worker, so this handler is called SYNCHRONOUSLY, in-line with
+the recording task -- the deadlock is real, not theoretical.
+
+The handler therefore hands off to a daemon thread which waits for
+`status == completed` and then writes the sidecars, returning immediately. That
+thread calls `close_old_connections()` in its own `finally` block, as the same
+documentation requires of any thread a plugin spawns that touches the ORM.
 """
 
 import json
@@ -232,7 +241,7 @@ def _duration(path):
 
 class Plugin:
     name = "DVR NFO Generator"
-    version = "1.2.0"
+    version = "1.2.1"
     description = (
         "Writes Kodi/Plex NFO sidecars, posters and episode thumbnails for DVR "
         "recordings so they present with real titles, summaries and artwork "
@@ -425,6 +434,7 @@ class Plugin:
             "id": "webhook_header",
             "label": "Extra header (optional)",
             "type": "string",
+            "input_type": "password",
             "default": "",
             "description": "One header as 'Name: value', e.g. 'X-Api-Key: abc123'.",
         },
@@ -450,11 +460,9 @@ class Plugin:
             "id": "plex_token",
             "label": "Plex token",
             "type": "string",
+            "input_type": "password",
             "default": "",
-            "description": (
-                "X-Plex-Token. Sent as a header, never in a URL. Stored in "
-                "plain text in the plugin config."
-            ),
+            "description": "X-Plex-Token. Sent as a header, never in a URL.",
         },
         {
             "id": "_sec_behaviour",
