@@ -172,6 +172,28 @@ def _pretty(root):
     return '<?xml version="1.0" encoding="UTF-8" standalone="yes" ?>\n' + body
 
 
+def _match_dir_owner(path):
+    """Give a newly written file the same ownership as the directory holding it.
+
+    Dispatcharr's container runs as root, so sidecars land root-owned beside
+    media owned by the media user. Everything still *reads*, which is why this
+    goes unnoticed, but any later tooling running as that user cannot move or
+    delete the sidecars it is supposed to manage.
+
+    Best effort: silently does nothing where it cannot (unprivileged container,
+    non-POSIX filesystem, squashed NFS root).
+    """
+    try:
+        want = os.stat(os.path.dirname(path))
+        have = os.stat(path)
+        if (have.st_uid, have.st_gid) == (want.st_uid, want.st_gid):
+            return False
+        os.chown(path, want.st_uid, want.st_gid)
+        return True
+    except (OSError, AttributeError):
+        return False
+
+
 def _write(path, content, overwrite):
     if os.path.exists(path) and not overwrite:
         return False
@@ -179,6 +201,7 @@ def _write(path, content, overwrite):
     with open(tmp, "w", encoding="utf-8") as fh:
         fh.write(content)
     os.replace(tmp, path)
+    _match_dir_owner(path)
     return True
 
 
@@ -209,7 +232,7 @@ def _duration(path):
 
 class Plugin:
     name = "DVR NFO Generator"
-    version = "1.1.0"
+    version = "1.2.0"
     description = (
         "Writes Kodi/Plex NFO sidecars, posters and episode thumbnails for DVR "
         "recordings so they present with real titles, summaries and artwork "
@@ -406,6 +429,34 @@ class Plugin:
             "description": "One header as 'Name: value', e.g. 'X-Api-Key: abc123'.",
         },
         {
+            "id": "_sec_plex",
+            "label": "Plex artwork refresh",
+            "type": "info",
+            "description": (
+                "Optional, Plex-specific. A library scan re-reads episode NFOs "
+                "but IGNORES a show's poster.jpg, so when the poster changes "
+                "Plex keeps serving the old one until that show's metadata is "
+                "refreshed. Fill these in and the plugin does it for you."
+            ),
+        },
+        {
+            "id": "plex_url",
+            "label": "Plex base URL",
+            "type": "string",
+            "default": "",
+            "description": "e.g. http://plex:32400 — leave blank to disable.",
+        },
+        {
+            "id": "plex_token",
+            "label": "Plex token",
+            "type": "string",
+            "default": "",
+            "description": (
+                "X-Plex-Token. Sent as a header, never in a URL. Stored in "
+                "plain text in the plugin config."
+            ),
+        },
+        {
             "id": "_sec_behaviour",
             "label": "Behaviour",
             "type": "info",
@@ -469,6 +520,16 @@ class Plugin:
             "button_variant": "outline",
         },
         {
+            "id": "refresh_plex_artwork",
+            "label": "Refresh show artwork in Plex",
+            "description": (
+                "Force a metadata refresh of every show that has a poster, so "
+                "Plex re-reads poster.jpg. A library scan does not do this."
+            ),
+            "button_label": "Refresh artwork",
+            "button_variant": "outline",
+        },
+        {
             "id": "test_webhook",
             "label": "Test the webhook",
             "description": (
@@ -485,6 +546,11 @@ class Plugin:
         # One TVmaze answer per show name per process, negatives included, so a
         # bulk regenerate over 30 recordings of the same show is a single call.
         self._poster_cache = {}
+        # Same idea for Plex show ratingKeys.
+        self._plex_key_cache = {}
+        # A bulk regenerate touches every episode of a show, but the show only
+        # needs refreshing once for its poster.
+        self._refreshed_shows = set()
 
     # ---------------------------------------------------------------- helpers
 
@@ -517,6 +583,8 @@ class Plugin:
             "webhook_from": (s.get("webhook_path_from") or "").rstrip("/"),
             "webhook_to": (s.get("webhook_path_to") or "").rstrip("/"),
             "webhook_header": (s.get("webhook_header") or "").strip(),
+            "plex_url": (s.get("plex_url") or "").strip().rstrip("/"),
+            "plex_token": (s.get("plex_token") or "").strip(),
         }
 
     def _episode_title(self, prog, aired, season, episode, show, mode):
@@ -649,6 +717,7 @@ class Plugin:
         )
         if ok and os.path.exists(tmp) and os.path.getsize(tmp) > 0:
             os.replace(tmp, plan["thumb"])
+            _match_dir_owner(plan["thumb"])
             return True
         if os.path.exists(tmp):
             try:
@@ -733,11 +802,72 @@ class Plugin:
                 shutil.copyfileobj(r, fh)
             if os.path.getsize(tmp) > 0:
                 os.replace(tmp, dest)
+                _match_dir_owner(dest)
                 return True
             os.remove(tmp)
         except Exception as e:
             log.debug("[%s] poster fetch failed (%s): %s", PLUGIN_KEY, url, e)
         return False
+
+    def _plex(self, cfg, path, method="GET"):
+        """One Plex API call. Token travels as a header, never in the URL."""
+        import urllib.request
+
+        req = urllib.request.Request(
+            cfg["plex_url"] + path,
+            headers={"X-Plex-Token": cfg["plex_token"], "Accept": "application/xml"},
+            method=method,
+        )
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return r.read()
+
+    def _plex_show_key(self, show, cfg, log):
+        """ratingKey of a show, matched by title across every TV section.
+
+        Only show-level keys are needed: episode NFOs are picked up by an
+        ordinary scan, and it is the show poster that a scan ignores.
+        """
+        if show in self._plex_key_cache:
+            return self._plex_key_cache[show]
+
+        key = None
+        try:
+            sections = ET.fromstring(self._plex(cfg, "/library/sections"))
+            for section in sections.iter("Directory"):
+                if section.get("type") != "show":
+                    continue
+                listing = ET.fromstring(
+                    self._plex(cfg, "/library/sections/%s/all?type=2" % section.get("key"))
+                )
+                for entry in listing.iter("Directory"):
+                    if entry.get("title") == show:
+                        key = entry.get("ratingKey")
+                        break
+                if key:
+                    break
+        except Exception as e:
+            log.debug("[%s] Plex show lookup failed for %r: %s", PLUGIN_KEY, show, e)
+
+        self._plex_key_cache[show] = key
+        return key
+
+    def _plex_refresh_show(self, show, cfg, log):
+        """Force a metadata refresh so Plex re-reads a changed poster."""
+        if not (cfg["plex_url"] and cfg["plex_token"]):
+            return False
+        key = self._plex_show_key(show, cfg, log)
+        if not key:
+            log.info("[%s] no Plex show matching %r; artwork refresh skipped",
+                     PLUGIN_KEY, show)
+            return False
+        try:
+            self._plex(cfg, "/library/metadata/%s/refresh?force=1" % key, method="PUT")
+            log.info("[%s] forced Plex artwork refresh for %r (ratingKey %s)",
+                     PLUGIN_KEY, show, key)
+            return True
+        except Exception as e:
+            log.warning("[%s] Plex refresh failed for %r: %s", PLUGIN_KEY, show, e)
+            return False
 
     def _fire_webhook(self, plan, cfg, log):
         """Notify another service that one recording is ready.
@@ -810,7 +940,7 @@ class Plugin:
         """Write every sidecar for one recording. Returns a per-file summary."""
         plan = self._plan(cp, path, cfg)
         wrote = {"nfo": False, "tvshow": False, "poster": False, "thumb": False,
-                 "webhook": False}
+                 "webhook": False, "plex": False}
 
         if dry_run:
             return plan, wrote
@@ -833,6 +963,12 @@ class Plugin:
             )
         if cfg["poster"]:
             wrote["poster"] = self._fetch_poster(plan, cfg, log)
+
+        # A scan re-reads episode NFOs but ignores a show's poster.jpg, so only
+        # a new poster needs the forced refresh -- and only once per show.
+        if wrote["poster"] and plan["show"] not in self._refreshed_shows:
+            self._refreshed_shows.add(plan["show"])
+            wrote["plex"] = self._plex_refresh_show(plan["show"], cfg, log)
 
         # Only notify when something actually changed, so a no-op sweep over a
         # library that is already complete does not spray a scan relay.
@@ -907,6 +1043,30 @@ class Plugin:
             ).start()
             return {"status": "ok", "message": f"Queued sidecar write for recording {rid}"}
 
+        if action == "refresh_plex_artwork":
+            if not (cfg["plex_url"] and cfg["plex_token"]):
+                return {"status": "error",
+                        "message": "Set the Plex base URL and token first"}
+            shows, done, missed = set(), 0, []
+            for _rec, cp, path in self._recording_rows():
+                if not os.path.exists(path):
+                    continue
+                show = self._plan(cp, path, cfg)["show"]
+                if show in shows:
+                    continue
+                shows.add(show)
+                if self._plex_refresh_show(show, cfg, log):
+                    done += 1
+                else:
+                    missed.append(show)
+            return {
+                "status": "ok",
+                "message": "Refreshed %d of %d show(s) in Plex.%s" % (
+                    done, len(shows),
+                    (" Not matched: " + ", ".join(missed[:5])) if missed else "",
+                ),
+            }
+
         if action == "test_webhook":
             if not cfg["webhook_url"]:
                 return {"status": "error", "message": "No webhook URL is configured"}
@@ -936,7 +1096,8 @@ class Plugin:
             done = 0
             missing_file = 0
             lines = []
-            totals = {"nfo": 0, "tvshow": 0, "poster": 0, "thumb": 0, "webhook": 0}
+            totals = {"nfo": 0, "tvshow": 0, "poster": 0, "thumb": 0,
+                      "webhook": 0, "plex": 0}
 
             for _rec, cp, path in rows:
                 if not os.path.exists(path):
@@ -969,6 +1130,8 @@ class Plugin:
                 )
                 if cfg["webhook_url"]:
                     msg += f" Notified {totals['webhook']}."
+                if totals["plex"]:
+                    msg += f" Refreshed {totals['plex']} show(s) in Plex."
             return {"status": "ok", "message": msg, "results": lines}
 
         return {"status": "error", "message": f"Unknown action '{action}'"}

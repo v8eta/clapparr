@@ -45,6 +45,7 @@ Plex will ignore these files unless the library is set up to read them:
 | **Generate missing sidecars** | Writes anything absent, leaves existing files alone |
 | **Regenerate all sidecars** | Rewrites everything, replacing existing files |
 | **Preview** | Shows what would be written, touches nothing |
+| **Refresh show artwork in Plex** | Forces a metadata refresh of every show, so Plex re-reads `poster.jpg` |
 | **Test the webhook** | Fires the webhook against your most recent recording |
 
 ## Settings
@@ -68,6 +69,16 @@ Plex will ignore these files unless the library is set up to read them:
 | Method | `GET` | `POST` sends the fields as JSON |
 | Rewrite path prefix — from / to | *(blank)* | Translate Dispatcharr's path into what the other service sees |
 | Extra header | *(blank)* | One header as `Name: value` |
+| Plex base URL | *(blank)* | e.g. `http://plex:32400` — enables the artwork refresh below |
+| Plex token | *(blank)* | Sent as a header, never in a URL |
+
+### Plex artwork refresh
+
+A library scan re-reads episode NFOs but **ignores a show's `poster.jpg`**, so when a poster changes Plex keeps serving the old one indefinitely. Fill in the Plex URL and token and the plugin issues the forced per-show refresh itself, once per show, and only when a poster was actually written.
+
+The show is matched by title across every TV-type section; if Plex has no show by that name the refresh is skipped and says so, rather than refreshing something else. There's also a **Refresh show artwork in Plex** action to sweep the whole library on demand.
+
+Leave these blank and the plugin never talks to Plex — the webhook alone still keeps episode titles and summaries current.
 
 ### Notifying another service
 
@@ -145,6 +156,12 @@ Set this off if you would rather have no poster than a possibly wrong one.
 
 A handler that blocked waiting for the finished file would deadlock the task that produces it.
 
+## File ownership
+
+Dispatcharr's container runs as **root**, so anything it writes lands root-owned — beside media that usually belongs to a media user. Everything still *reads*, which is why this goes unnoticed, but tooling running as that user later cannot move or delete the sidecars it is meant to manage.
+
+Each file the plugin writes is therefore given the same ownership as the directory holding it. It is best effort and silently does nothing where it cannot: an unprivileged container, a non-POSIX filesystem, or NFS with a squashed root.
+
 ## Requirements
 
 - Dispatcharr v0.20.0 or newer
@@ -154,9 +171,12 @@ A handler that blocked waiting for the finished file would deadlock the task tha
 
 `test_fuzzy_match.py` covers the artwork matcher, including live TVmaze lookups and the adversarial cases the guards exist for. `test_webhook.py` covers path rewriting and credential handling, with no network access.
 
+`test_ownership_plex.py` covers ownership matching and the Plex refresh, also offline.
+
 ```bash
 python3 dvr_nfo_generator/test_fuzzy_match.py
 python3 dvr_nfo_generator/test_webhook.py
+python3 dvr_nfo_generator/test_ownership_plex.py
 ```
 
 ## Licence
