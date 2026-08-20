@@ -93,7 +93,14 @@ Use **Test the webhook** to check the URL and the rewrite against a real recordi
 > Credentials placed in the URL are converted to an `Authorization` header and stripped from the URL *before* the request is built, so they cannot appear in a success line or in a `urllib` exception (which quotes the URL back). They are still stored in plain text in Dispatcharr's plugin config, so prefer a scoped credential.
 
 > [!TIP]
-> A scan is not the same as a metadata refresh. Telling a relay to scan a path picks up **new** recordings, but it will not necessarily re-read sidecars for an episode the server has already catalogued — changing an existing episode's artwork or NFO still needs a forced metadata refresh of that item.
+> **A scan re-reads episode NFOs, but not show-level artwork.** Measured against Plex by changing content and watching a single item:
+>
+> | Change | Path-scoped scan | `PUT /library/metadata/{key}/refresh?force=1` |
+> |---|---|---|
+> | Episode `.nfo` (title, summary) | picked up | not needed |
+> | Show `poster.jpg` | ignored | required |
+>
+> So the webhook on its own keeps episode titles and summaries current — changing the title style and regenerating propagates with no forced refresh. Show artwork is the exception, and rare, since a poster is fetched once.
 
 ### Episode titles for daily programmes
 
