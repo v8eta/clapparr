@@ -1,4 +1,8 @@
-"""DVR NFO Generator - Kodi/Plex sidecar metadata for Dispatcharr recordings.
+"""Clapparr - the metadata slate for Dispatcharr DVR recordings.
+
+Writes Kodi/Plex sidecar metadata (NFOs, posters, thumbnails) so recordings
+present with real titles, summaries and artwork. Named for the clapperboard:
+the slate that identifies footage is exactly what this writes for recordings.
 
 Dispatcharr records the file; media servers then have to guess what it is. Plex's
 TV scanner takes the episode index from the FILENAME and its NFO agent skips any
@@ -46,7 +50,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime
 from xml.dom import minidom
 
-PLUGIN_KEY = "dvr_nfo_generator"
+PLUGIN_KEY = "clapparr"
 
 # How often the waiter re-checks for the finished file.
 _POLL_SECONDS = 10
@@ -240,15 +244,15 @@ def _duration(path):
 
 
 class Plugin:
-    name = "DVR NFO Generator"
-    version = "1.2.1"
+    name = "Clapparr"
+    version = "1.3.0"
     description = (
-        "Writes Kodi/Plex NFO sidecars, posters and episode thumbnails for DVR "
-        "recordings so they present with real titles, summaries and artwork "
-        "instead of 'Episode 08-18'."
+        "The metadata slate for your DVR: writes Kodi/Plex NFO sidecars, "
+        "posters and episode thumbnails so recordings present with real "
+        "titles, summaries and artwork instead of 'Episode 08-18'."
     )
-    author = "touki"
-    help_url = "https://github.com/Dispatcharr/Plugins"
+    author = "v8eta"
+    help_url = "https://github.com/v8eta/clapparr#readme"
 
     fields = [
         {

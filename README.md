@@ -1,6 +1,12 @@
-# DVR NFO Generator
+<div align="center">
+  <img src="clapparr/logo.png" alt="Clapparr" width="140"/>
+  <h1>Clapparr</h1>
+  <p><strong>The metadata slate for your DVR.</strong></p>
+</div>
 
 A [Dispatcharr](https://github.com/Dispatcharr/Dispatcharr) plugin that writes Kodi/Plex NFO sidecars, posters and episode thumbnails for DVR recordings, so they present with real titles, summaries and artwork instead of `Episode 08-18`.
+
+Named for the clapperboard: the slate that identifies footage — title, scene, take — is exactly what this writes for your recordings.
 
 Dispatcharr already knows the title, sub-title, description, season, episode and poster URL of everything it records — it stores them on the `Recording` row. This plugin writes that back out beside the file, where a media server can read it.
 
@@ -17,10 +23,10 @@ Read by **Plex** (agent: *Plex TV Series Agent (NFO)*), **Emby**, **Jellyfin** a
 
 **From the Dispatcharr plugin browser** — search for *DVR NFO Generator*.
 
-**Manually** — download `plugin-dvr-nfo-generator-vX.Y.Z.zip` from [Releases](../../releases) and upload it in Dispatcharr under **Plugins → Import**, or unzip it into your plugins directory:
+**Manually** — download `plugin-clapparr-vX.Y.Z.zip` from [Releases](../../releases) and upload it in Dispatcharr under **Plugins → Import**, or unzip it into your plugins directory:
 
 ```
-/data/plugins/dvr_nfo_generator/
+/data/plugins/clapparr/
 ```
 
 Then enable the plugin and press **Generate missing sidecars**.
@@ -134,7 +140,7 @@ Loose title matching is how the wrong show's artwork gets attached to a recordin
 Every decision is logged with its reasoning, so a wrong poster is traceable to the rule that admitted it:
 
 ```
-[dvr_nfo_generator] artwork fallback for 'Highway Patrol Special':
+[clapparr] artwork fallback for 'Highway Patrol Special':
   query 'highway patrol' matched 'Highway Patrol' (AU), coverage 0.67
 ```
 
@@ -174,9 +180,9 @@ Each file the plugin writes is therefore given the same ownership as the directo
 `test_ownership_plex.py` covers ownership matching and the Plex refresh, also offline.
 
 ```bash
-python3 dvr_nfo_generator/test_fuzzy_match.py
-python3 dvr_nfo_generator/test_webhook.py
-python3 dvr_nfo_generator/test_ownership_plex.py
+python3 clapparr/test_fuzzy_match.py
+python3 clapparr/test_webhook.py
+python3 clapparr/test_ownership_plex.py
 ```
 
 ## Licence
