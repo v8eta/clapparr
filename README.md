@@ -17,7 +17,7 @@ Dispatcharr already knows the title, sub-title, description, season, episode and
 <show>/<recording>-thumb.jpg      episode still
 ```
 
-Read by **Plex** (agent: *Plex TV Series Agent (NFO)*), **Emby**, **Jellyfin** and **Kodi**.
+Written in the standard Kodi NFO format, which **Plex** (agent: *Plex TV Series Agent (NFO)*), **Kodi**, **Jellyfin** and **Emby** all read. Developed and tested against **Plex only** — see [Tested on](#tested-on).
 
 ## Install
 
@@ -37,6 +37,8 @@ Plex will ignore these files unless the library is set up to read them:
 
 1. Library → **Edit** → **Advanced** → Agent = **Plex TV Series Agent (NFO)**
 2. Keep **Use local assets** enabled (it is on by default)
+
+The NFO agent needs PMS **1.43.1 or newer** and is available to everyone — **no Plex Pass required**. One Plex-side limitation: NFO-agent libraries don't support Plex's watch-state/ratings sync.
 
 > [!IMPORTANT]
 > **Plex takes the episode index from the *filename*, and its NFO agent skips any episode it could not index.** A recording named `Seven News - 2026-08-18.mkv` becomes a date-based episode with no season/episode, and Plex will ignore its `.nfo` entirely — adding `<season>`/`<episode>` to the NFO does not help.
@@ -185,6 +187,29 @@ python3 clapparr/test_webhook.py
 python3 clapparr/test_ownership_plex.py
 ```
 
+## How much EPG data does it need?
+
+Not much — every field degrades on its own:
+
+- **No episode title?** The episode is named by air date (`Wednesday 19 August 2026`) — configurable to a short date, episode number, or show name.
+- **No description?** The plot is simply omitted.
+- **No poster?** The TVmaze fallback tries a strict match; if it isn't confident, you get no poster rather than the wrong one.
+- **No EPG entry at all?** The show name comes from the folder and the air date from the recording itself.
+
+The one thing that genuinely matters is **season/episode numbers — and only on Plex**. Without them, Dispatcharr names the file on its date-based template, and Plex's NFO agent skips date-based episodes entirely, so the NFO is written but never applied. Kodi, Jellyfin and Emby are documented as more forgiving of date-named files. Also beware a source that *reuses* episode numbers across different broadcasts: Plex will merge them into one episode.
+
+## Tested on
+
+Developed and tested against **Plex only** (PMS 1.43.1+, NFO agent). The sidecars are standard Kodi-format NFOs, which Kodi, Jellyfin and Emby also read, but I haven't run them myself. **Feedback from Kodi/Jellyfin/Emby users is very welcome** — open an issue with what worked and what didn't.
+
+## A note on this project
+
+Clapparr is a personal project, built to scratch an itch on my own DVR and shared in case it saves someone else the same work. It gets attention when my setup needs it. Issues and PRs are welcome and read — just calibrate expectations accordingly.
+
 ## Licence
 
 MIT — see [LICENSE](LICENSE).
+
+---
+
+AI tools were used in Clapparr's development. Design decisions, testing and everything shipped were reviewed by a human, and the behaviour documented above was verified against a live Dispatcharr + Plex setup before release.
