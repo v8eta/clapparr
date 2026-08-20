@@ -45,6 +45,7 @@ Plex will ignore these files unless the library is set up to read them:
 | **Generate missing sidecars** | Writes anything absent, leaves existing files alone |
 | **Regenerate all sidecars** | Rewrites everything, replacing existing files |
 | **Preview** | Shows what would be written, touches nothing |
+| **Test the webhook** | Fires the webhook against your most recent recording |
 
 ## Settings
 
@@ -63,6 +64,36 @@ Plex will ignore these files unless the library is set up to read them:
 | When the EPG has no episode title | air date (long) | Also: short date, episode number, or show name |
 | Overwrite existing sidecars | off | So hand-edited metadata is never clobbered |
 | Wait up to N minutes for the remux | `30` | Long recordings take longer |
+| Webhook URL | *(blank)* | Called once per recording after its sidecars are written |
+| Method | `GET` | `POST` sends the fields as JSON |
+| Rewrite path prefix — from / to | *(blank)* | Translate Dispatcharr's path into what the other service sees |
+| Extra header | *(blank)* | One header as `Name: value` |
+
+### Notifying another service
+
+Set a **Webhook URL** and the plugin calls it once per recording, after that recording's sidecars are written — and only when something actually changed, so a no-op sweep over a complete library doesn't spray the receiver.
+
+Placeholders: `{path}` `{dir}` `{file}` `{show}`.
+
+The obvious use is a scan relay such as [autopulse](https://github.com/dan-online/autopulse), so the media server rescans just that path instead of the whole library:
+
+```
+http://user:pass@autopulse:2875/triggers/manual?path={path}
+```
+
+Dispatcharr writes to its own container paths, which usually are not what the media server calls the same file, so set the rewrite pair:
+
+| From | To |
+|---|---|
+| `/data/recordings/TV_Shows` | `/mnt/unionfs/dvr` |
+
+Use **Test the webhook** to check the URL and the rewrite against a real recording without waiting for one to finish.
+
+> [!NOTE]
+> Credentials placed in the URL are converted to an `Authorization` header and stripped from the URL *before* the request is built, so they cannot appear in a success line or in a `urllib` exception (which quotes the URL back). They are still stored in plain text in Dispatcharr's plugin config, so prefer a scoped credential.
+
+> [!TIP]
+> A scan is not the same as a metadata refresh. Telling a relay to scan a path picks up **new** recordings, but it will not necessarily re-read sidecars for an episode the server has already catalogued — changing an existing episode's artwork or NFO still needs a forced metadata refresh of that item.
 
 ### Episode titles for daily programmes
 
@@ -114,10 +145,11 @@ A handler that blocked waiting for the finished file would deadlock the task tha
 
 ## Tests
 
-`dvr_nfo_generator/test_fuzzy_match.py` covers the artwork matcher, including live TVmaze lookups and the adversarial cases the guards exist for:
+`test_fuzzy_match.py` covers the artwork matcher, including live TVmaze lookups and the adversarial cases the guards exist for. `test_webhook.py` covers path rewriting and credential handling, with no network access.
 
 ```bash
 python3 dvr_nfo_generator/test_fuzzy_match.py
+python3 dvr_nfo_generator/test_webhook.py
 ```
 
 ## Licence

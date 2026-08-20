@@ -83,6 +83,18 @@ def _norm_words(name):
     return [w for w in re.split(r"[^0-9a-z]+", (name or "").lower()) if w]
 
 
+def _rewrite_path(path, frm, to):
+    """Translate a container path into whatever the notified service sees.
+
+    Dispatcharr writes to /data/recordings/... while the media server may know
+    the same file as /mnt/unionfs/dvr/..., so a scan request carrying the raw
+    container path finds nothing.
+    """
+    if frm and path.startswith(frm):
+        return to + path[len(frm):]
+    return path
+
+
 def _show_country(show):
     """Two-letter country for a TVmaze show, via its network or web channel."""
     for key in ("network", "webChannel"):
@@ -197,7 +209,7 @@ def _duration(path):
 
 class Plugin:
     name = "DVR NFO Generator"
-    version = "1.0.0"
+    version = "1.1.0"
     description = (
         "Writes Kodi/Plex NFO sidecars, posters and episode thumbnails for DVR "
         "recordings so they present with real titles, summaries and artwork "
@@ -336,6 +348,64 @@ class Plugin:
             ],
         },
         {
+            "id": "_sec_webhook",
+            "label": "Notify another service after writing",
+            "type": "info",
+            "description": (
+                "Optional. Calls a URL once per recording, after its sidecars "
+                "are written — for a scan relay such as autopulse, or anything "
+                "else that wants to know a recording is ready. Placeholders: "
+                "{path} {dir} {file} {show}."
+            ),
+        },
+        {
+            "id": "webhook_url",
+            "label": "Webhook URL",
+            "type": "string",
+            "default": "",
+            "description": (
+                "Left blank, nothing is called. Example for autopulse: "
+                "http://user:pass@autopulse:2875/triggers/manual?path={path} — "
+                "credentials in the URL are converted to an auth header and are "
+                "never written to the log. Stored in plain text in the plugin "
+                "config, so prefer a scoped credential."
+            ),
+        },
+        {
+            "id": "webhook_method",
+            "label": "Method",
+            "type": "select",
+            "default": "GET",
+            "options": [
+                {"value": "GET", "label": "GET (autopulse and most relays)"},
+                {"value": "POST", "label": "POST (sends the fields as JSON)"},
+            ],
+        },
+        {
+            "id": "webhook_path_from",
+            "label": "Rewrite path prefix — from",
+            "type": "string",
+            "default": "",
+            "description": (
+                "Dispatcharr's own path, e.g. /data/recordings/TV_Shows. Leave "
+                "both blank if the other service sees the same paths."
+            ),
+        },
+        {
+            "id": "webhook_path_to",
+            "label": "Rewrite path prefix — to",
+            "type": "string",
+            "default": "",
+            "description": "What the notified service calls it, e.g. /mnt/unionfs/dvr.",
+        },
+        {
+            "id": "webhook_header",
+            "label": "Extra header (optional)",
+            "type": "string",
+            "default": "",
+            "description": "One header as 'Name: value', e.g. 'X-Api-Key: abc123'.",
+        },
+        {
             "id": "_sec_behaviour",
             "label": "Behaviour",
             "type": "info",
@@ -398,6 +468,17 @@ class Plugin:
             "button_label": "Preview",
             "button_variant": "outline",
         },
+        {
+            "id": "test_webhook",
+            "label": "Test the webhook",
+            "description": (
+                "Fires the configured webhook against your most recent "
+                "recording, so the URL and any path rewrite can be checked "
+                "without waiting for one to finish."
+            ),
+            "button_label": "Send test",
+            "button_variant": "outline",
+        },
     ]
 
     def __init__(self):
@@ -431,6 +512,11 @@ class Plugin:
             "fuzzy": bool(s.get("artwork_fuzzy_fallback", True)),
             "fuzzy_coverage": max(0.0, min(1.0, num("fuzzy_min_coverage", 0.6))),
             "country": (s.get("tvmaze_country") or "").strip().upper(),
+            "webhook_url": (s.get("webhook_url") or "").strip(),
+            "webhook_method": (s.get("webhook_method") or "GET").strip().upper(),
+            "webhook_from": (s.get("webhook_path_from") or "").rstrip("/"),
+            "webhook_to": (s.get("webhook_path_to") or "").rstrip("/"),
+            "webhook_header": (s.get("webhook_header") or "").strip(),
         }
 
     def _episode_title(self, prog, aired, season, episode, show, mode):
@@ -653,10 +739,78 @@ class Plugin:
             log.debug("[%s] poster fetch failed (%s): %s", PLUGIN_KEY, url, e)
         return False
 
+    def _fire_webhook(self, plan, cfg, log):
+        """Notify another service that one recording is ready.
+
+        Any credentials in the URL are moved into an Authorization header and
+        stripped from the URL BEFORE the request is made, so neither a success
+        line nor a urllib exception (which quotes the URL back) can leak them.
+        """
+        template = cfg["webhook_url"]
+        if not template:
+            return False
+
+        import base64
+        import urllib.parse
+        import urllib.request
+
+        media = _rewrite_path(plan["mkv"], cfg["webhook_from"], cfg["webhook_to"])
+        values = {
+            "path": media,
+            "dir": os.path.dirname(media),
+            "file": os.path.basename(media),
+            "show": plan["show"],
+        }
+        try:
+            url = template.format(
+                **{k: urllib.parse.quote(v, safe="/") for k, v in values.items()}
+            )
+        except (KeyError, IndexError, ValueError) as e:
+            log.warning("[%s] webhook URL template is not usable: %s", PLUGIN_KEY, e)
+            return False
+
+        headers = {"User-Agent": "Dispatcharr-NFO"}
+        parts = urllib.parse.urlsplit(url)
+        if parts.username or parts.password:
+            token = "%s:%s" % (parts.username or "", parts.password or "")
+            headers["Authorization"] = "Basic " + base64.b64encode(
+                token.encode("utf-8")
+            ).decode("ascii")
+            netloc = parts.hostname or ""
+            if parts.port:
+                netloc = "%s:%d" % (netloc, parts.port)
+            url = urllib.parse.urlunsplit(
+                (parts.scheme, netloc, parts.path, parts.query, parts.fragment)
+            )
+
+        if cfg["webhook_header"] and ":" in cfg["webhook_header"]:
+            name, value = cfg["webhook_header"].split(":", 1)
+            if name.strip():
+                headers[name.strip()] = value.strip()
+
+        method = "POST" if cfg["webhook_method"] == "POST" else "GET"
+        body = None
+        if method == "POST":
+            body = json.dumps(values).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+
+        try:
+            req = urllib.request.Request(url, data=body, headers=headers, method=method)
+            with urllib.request.urlopen(req, timeout=15) as r:
+                status = getattr(r, "status", None) or r.getcode()
+            log.info("[%s] webhook %s -> HTTP %s for %s",
+                     PLUGIN_KEY, method, status, os.path.basename(media))
+            return True
+        except Exception as e:
+            log.warning("[%s] webhook %s failed for %s: %s",
+                        PLUGIN_KEY, method, os.path.basename(media), e)
+            return False
+
     def _emit(self, cp, path, cfg, log, dry_run=False):
         """Write every sidecar for one recording. Returns a per-file summary."""
         plan = self._plan(cp, path, cfg)
-        wrote = {"nfo": False, "tvshow": False, "poster": False, "thumb": False}
+        wrote = {"nfo": False, "tvshow": False, "poster": False, "thumb": False,
+                 "webhook": False}
 
         if dry_run:
             return plan, wrote
@@ -679,6 +833,11 @@ class Plugin:
             )
         if cfg["poster"]:
             wrote["poster"] = self._fetch_poster(plan, cfg, log)
+
+        # Only notify when something actually changed, so a no-op sweep over a
+        # library that is already complete does not spray a scan relay.
+        if any(wrote.values()):
+            wrote["webhook"] = self._fire_webhook(plan, cfg, log)
 
         return plan, wrote
 
@@ -748,6 +907,26 @@ class Plugin:
             ).start()
             return {"status": "ok", "message": f"Queued sidecar write for recording {rid}"}
 
+        if action == "test_webhook":
+            if not cfg["webhook_url"]:
+                return {"status": "error", "message": "No webhook URL is configured"}
+            rows = self._recording_rows()
+            rows = [r for r in rows if os.path.exists(r[2])]
+            if not rows:
+                return {"status": "error",
+                        "message": "No recording with a file on disk to test against"}
+            _rec, cp, path = rows[0]
+            plan = self._plan(cp, path, cfg)
+            sent = self._fire_webhook(plan, cfg, log)
+            target = _rewrite_path(plan["mkv"], cfg["webhook_from"], cfg["webhook_to"])
+            return {
+                "status": "ok" if sent else "error",
+                "message": (
+                    "%s the webhook with path %s"
+                    % ("Sent" if sent else "Failed to send", target)
+                ),
+            }
+
         if action in ("generate_missing", "regenerate_all", "preview"):
             if action == "regenerate_all":
                 cfg["overwrite"] = True
@@ -757,7 +936,7 @@ class Plugin:
             done = 0
             missing_file = 0
             lines = []
-            totals = {"nfo": 0, "tvshow": 0, "poster": 0, "thumb": 0}
+            totals = {"nfo": 0, "tvshow": 0, "poster": 0, "thumb": 0, "webhook": 0}
 
             for _rec, cp, path in rows:
                 if not os.path.exists(path):
@@ -788,6 +967,8 @@ class Plugin:
                     f" Wrote nfo={totals['nfo']} tvshow={totals['tvshow']} "
                     f"poster={totals['poster']} thumb={totals['thumb']}."
                 )
+                if cfg["webhook_url"]:
+                    msg += f" Notified {totals['webhook']}."
             return {"status": "ok", "message": msg, "results": lines}
 
         return {"status": "error", "message": f"Unknown action '{action}'"}
