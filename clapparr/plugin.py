@@ -502,6 +502,16 @@ class Plugin:
 
     actions = [
         {
+            "id": "on_recording_start",
+            "label": "Handle recording_start",
+            "description": (
+                "Internal. Fires automatically when a recording begins, and "
+                "captures the episode name from the EPG into the recording "
+                "while that row is certainly still present."
+            ),
+            "events": ["recording_start"],
+        },
+        {
             "id": "on_recording_end",
             "label": "Handle recording_end",
             "description": "Internal. Fires automatically when a recording finishes.",
@@ -599,10 +609,130 @@ class Plugin:
             "plex_token": (s.get("plex_token") or "").strip(),
         }
 
+    def _fresh_sub_title(self, prog, log=None):
+        """Episode NAME the EPG holds NOW for this airing, or None.
+
+        The exact counterpart of _fresh_plot, and it exists for the exact same
+        reason its docstring gives: the snapshot on the Recording was taken when
+        the recording was SCHEDULED, and a provider publishes the episode name
+        as late as it publishes the synopsis.
+
+        ⛔ Without this the two halves of the same EPG row were treated
+        differently: the plot was re-read and correct, while the title fell back
+        to a date. Real NFOs carried
+            title "Wednesday 26 August 2026"
+            plot  "The teams are having problems with their trades..."
+        while the EPG held sub_title "Main Ensuite Week" for that very slot.
+
+        Same matching rules as _fresh_plot, deliberately -- tvg_id AND title AND
+        a tight window. Title is not optional: matching on tvg_id plus a window
+        selects the NEIGHBOURING programme, which is how a 10 News+ recording
+        was once handed The Bold and the Beautiful's synopsis.
+        """
+        try:
+            from datetime import timedelta
+
+            from django.utils.dateparse import parse_datetime
+
+            from apps.epg.models import ProgramData
+
+            tvg = (prog.get("tvg_id") or "").strip()
+            title = (prog.get("title") or "").strip()
+            start = prog.get("start_time")
+            if not (tvg and title and start):
+                return None
+            st = parse_datetime(str(start)) if not hasattr(start, "year") else start
+            if st is None:
+                return None
+
+            win = timedelta(minutes=self.EPG_WINDOW_MIN)
+            best = None
+            for r in ProgramData.objects.filter(
+                    tvg_id=tvg, title=title,
+                    start_time__gte=st - win, start_time__lte=st + win):
+                sub = (getattr(r, "sub_title", "") or "").strip()
+                if not sub:
+                    # ⭐ The thin feed leaves sub_title EMPTY and puts the name on
+                    # the FIRST LINE of description instead:
+                    #     'Main Ensuite Week\nThe teams are picking tiles...'
+                    # Reading only sub_title misses those rows entirely -- measured
+                    # on The Block, 11 of 23 rows carry sub_title and the rest use
+                    # this shape.
+                    #
+                    # ⚠️ Only when there IS a second line. A single-line
+                    # description is a synopsis, not a name, and taking it would
+                    # put the whole plot in the title field.
+                    desc = (getattr(r, "description", "") or "").strip()
+                    head, sep, body = desc.partition(chr(10))
+                    if sep and body.strip() and 0 < len(head.strip()) <= 80:
+                        sub = head.strip()
+                if not sub or sub.lower() == "unknown":
+                    continue
+                # Longest wins, as with the plot: several feeds carry the same
+                # slot and only the richer one names the episode. Measured on
+                # The Block: 11 of 23 rows carry sub_title, the rest are blank.
+                if best is None or len(sub) > len(best):
+                    best = sub
+            return best
+        except Exception as e:  # noqa: BLE001
+            # Never let a metadata nicety break the NFO write.
+            if log:
+                log("clapparr: fresh sub_title lookup failed: %r" % (e,))
+            return None
+
+    # Show-level blurbs seen presented AS episode synopses. Compared
+    # case-insensitively on a prefix, because feeds truncate them at different
+    # lengths. Kept short and specific on purpose -- a broad rule here would
+    # start discarding real synopses, which is a worse failure than keeping a
+    # generic one.
+    _GENERIC_PLOT_HINTS = (
+        "is australia's leading current affairs program",
+        "what drives people in europe",
+    )
+
+    def _is_generic_plot(self, plot, show_plot=""):
+        """Is this the SHOW's blurb rather than the EPISODE's synopsis?
+
+        Two independent tests, because neither is sufficient alone:
+
+        1. It equals the series-level description we already hold (tvshow.nfo).
+           Exact, and catches any show without needing a hint for it.
+        2. It contains a known show-blurb phrase. Catches the case where the
+           series description was never captured, or differs in length.
+
+        ⚠️ Deliberately CONSERVATIVE. A false positive discards a real synopsis
+        and leaves an episode with no description at all; a false negative just
+        leaves today's behaviour. When in doubt this returns False.
+        """
+        p = (plot or "").strip().lower()
+        if not p:
+            return False
+        sp = (show_plot or "").strip().lower()
+        if sp and len(p) > 40 and (p == sp or p.startswith(sp[:120]) or sp.startswith(p[:120])):
+            return True
+        return any(h in p for h in self._GENERIC_PLOT_HINTS)
+
     def _episode_title(self, prog, aired, season, episode, show, mode):
+        # Snapshot first: if the name was already known at scheduling time it is
+        # correct and costs no query.
         sub = (prog.get("sub_title") or "").strip()
         if sub and sub.lower() != "unknown":
             return sub
+        # ⭐ Otherwise re-read the EPG, exactly as the plot does. This is the
+        # whole fix: the snapshot is usually taken before the provider names the
+        # episode, so a blank here does NOT mean the name is unavailable -- only
+        # that it was unavailable THEN. Verified on live data: four Block
+        # recordings whose snapshot had no title had one in the EPG, including
+        # "Main Ensuite Week" and "Living Dining and Alfresco Week".
+        #
+        # ⚠️ Only useful while the EPG row still exists. Retention is about two
+        # days of history, and clapparr runs when a recording FINISHES, so the
+        # row is minutes old at write time. The bulk-backfill action runs long
+        # after and will still fall through to the date -- correctly, because by
+        # then the answer is genuinely gone.
+        fresh = self._fresh_sub_title(prog)
+        if fresh:
+            return fresh
         if mode == "show_name":
             return show
         if mode == "episode_number" and episode:
@@ -630,8 +760,93 @@ class Plugin:
             rows.append((rec, cp, path))
         return rows
 
+    # Deliberately tight. The snapshot's start_time came from the very EPG row
+    # being re-read, so real drift is a minute or two; the window exists only to
+    # absorb that. It was 30 and is now 10 because a half-hour show that repeats
+    # back-to-back (DW Focus On Europe) can put the NEXT episode of the same
+    # title inside a 30-minute window, and a confidently-wrong synopsis is worse
+    # than a generic one.
+    EPG_WINDOW_MIN = 10
+
+    def _fresh_plot(self, prog, log=None):
+        """Best description the EPG holds NOW for this airing, or None.
+
+        The snapshot on the Recording was taken when it was scheduled, which for
+        a series is usually before the provider published the episode synopsis.
+        Re-reading at write time is the whole point of this function.
+        """
+        try:
+            from datetime import timedelta
+
+            from django.utils.dateparse import parse_datetime
+
+            from apps.epg.models import ProgramData
+
+            tvg = (prog.get("tvg_id") or "").strip()
+            title = (prog.get("title") or "").strip()
+            start = prog.get("start_time")
+            if not (tvg and title and start):
+                return None
+            st = parse_datetime(str(start)) if not hasattr(start, "year") else start
+            if st is None:
+                return None
+
+            # ⛔ TITLE IS NOT OPTIONAL. Matching only tvg_id + a time window
+            #    selects the NEIGHBOURING programme on that channel: tested
+            #    without it and a 10 News+ recording was handed the synopsis for
+            #    The Bold and the Beautiful, and another got Gogglebox. A wrong
+            #    synopsis stated confidently is far worse than a generic one, so
+            #    the title must pin the programme and the window only resolves
+            #    the small drift between the scheduled start and the EPG row.
+            win = timedelta(minutes=self.EPG_WINDOW_MIN)
+            rows = ProgramData.objects.filter(
+                tvg_id=tvg, title=title,
+                start_time__gte=st - win, start_time__lte=st + win,
+            )
+            # Two tiers, not one. "Longest wins" alone hands back a SHOW blurb
+            # whenever the feed carries one, because a marketing paragraph is
+            # usually longer than a real episode synopsis -- and a generic blurb
+            # presented as an episode plot is a quiet lie: it looks like real
+            # metadata and Plex displays it forever.
+            #
+            # ⚠️ Non-destructive by construction. Generic candidates are only
+            # DEPRIORITISED, never discarded: if every row is generic we still
+            # return one, so this can improve the answer and never empty it.
+            best = None          # best non-generic
+            fallback = None      # best generic, used only if nothing else
+            for r in rows:
+                desc = (r.description or "").strip()
+                if not desc:
+                    continue
+                # Longest wins within a tier: several feeds can carry the same
+                # slot, and a thinner source may supply only "E27 Sunday 23
+                # August 2026" where a richer one has the actual synopsis.
+                if self._is_generic_plot(desc):
+                    if fallback is None or len(desc) > len(fallback):
+                        fallback = desc
+                elif best is None or len(desc) > len(best):
+                    best = desc
+            if best is None:
+                best = fallback
+            # Only worth returning if it actually beats what we already have.
+            snap = (prog.get("description") or "").strip()
+            if best and best == snap:
+                return None
+            if best and log:
+                log.info("clapparr: EPG re-read gave a fresher plot for %s", title)
+            return best
+        except Exception as exc:  # never let metadata enrichment break the NFO
+            if log:
+                log.debug("clapparr: EPG re-read skipped (%s)", exc)
+            return None
+
     def _plan(self, cp, path, cfg):
-        """Work out every sidecar for one recording. Pure - touches no disk."""
+        """Work out every sidecar for one recording. Touches no disk.
+
+        No longer strictly pure: it reads the EPG to find a fresher episode
+        synopsis than the scheduling-time snapshot holds. That lookup is
+        wrapped so any failure falls back to the snapshot.
+        """
         prog = cp.get("program") or {}
         show = (prog.get("title") or "").strip() or os.path.basename(os.path.dirname(path))
 
@@ -661,14 +876,176 @@ class Plugin:
             "episode": episode,
             "aired": aired,
             "title": title,
-            "plot": (prog.get("description") or "").strip(),
+            # EPG first, snapshot second. The snapshot is what was known when
+            # the recording was SCHEDULED; the EPG is what is known now.
+            "plot": (self._fresh_plot(prog)
+                     or (prog.get("description") or "").strip()),
             "rating": cp.get("rating"),
             "poster_url": cp.get("poster_url"),
+            # ⭐ Everything below was already sitting in the row we had fetched.
+            # Reading it costs one dict lookup each -- the query is the expensive
+            # part and it had already happened. The EPG was carrying 21 keys that
+            # never reached an NFO, several of which map straight onto standard
+            # Kodi/Plex elements.
+            "extra": self._extra_fields(prog),
             "dir": os.path.dirname(path),
             "nfo": os.path.splitext(path)[0] + ".nfo",
             "thumb": os.path.splitext(path)[0] + "-thumb.jpg",
             "mkv": path,
         }
+
+    def _extra_fields(self, prog):
+        """The EPG detail that standard NFO elements can carry.
+
+        Purely a read of data already in hand -- the EPG row was fetched to get
+        the plot, so every key here is free.
+
+        ⚠️ Everything is OPTIONAL and individually guarded. A feed that omits a
+        key, or supplies it in an unexpected shape, must produce an NFO missing
+        one element rather than no NFO at all: this runs on every recording and
+        a malformed sidecar is worse than a sparse one. Hence the per-field
+        try/except rather than one around the lot, which would drop the whole
+        set on a single bad value.
+
+        ⛔ Deliberately NOT carried: `video`, `audio` and `subtitles`. Plex and
+        Kodi read those from the file itself, where they are authoritative; an
+        EPG's claim about aspect ratio or audio channels is a prediction, and a
+        wrong one would override the truth.
+        """
+        out = {"genres": [], "credits": {}, "tags": []}
+        if not isinstance(prog, dict):
+            return out
+
+        # ⛔⛔ THE SNAPSHOT DOES NOT CARRY THESE FIELDS. The Recording's
+        # `program` dict holds only description/episode/season/start_time/
+        # sub_title/title/tvg_id/... -- verified against live rows. Reading
+        # `prog` directly here would find nothing, write nothing, and look
+        # exactly like a working feature: the silent-disarm shape this codebase
+        # keeps hitting. The detail lives on the EPG row's custom_properties, so
+        # it has to be fetched the same way the plot is.
+        cp = {}
+        try:
+            from datetime import timedelta
+
+            from django.utils.dateparse import parse_datetime
+
+            from apps.epg.models import ProgramData
+
+            tvg = (prog.get("tvg_id") or "").strip()
+            title = (prog.get("title") or "").strip()
+            start = prog.get("start_time")
+            if tvg and title and start:
+                st = parse_datetime(str(start)) if not hasattr(start, "year") else start
+                if st is not None:
+                    win = timedelta(minutes=self.EPG_WINDOW_MIN)
+                    # Richest row wins: feeds differ, and the one with the most
+                    # keys is the one worth reading. Same tvg_id AND title AND
+                    # window as every other lookup here -- see _fresh_plot for
+                    # why the title is not optional.
+                    for r in ProgramData.objects.filter(
+                            tvg_id=tvg, title=title,
+                            start_time__gte=st - win, start_time__lte=st + win):
+                        rc = r.custom_properties
+                        if isinstance(rc, dict) and len(rc) > len(cp):
+                            cp = rc
+        except Exception:      # noqa: BLE001 - metadata is never worth an error
+            cp = {}
+        if not cp:
+            return out
+
+        def _try(fn):
+            try:
+                fn()
+            except Exception:   # noqa: BLE001 - one bad field must not cost the rest
+                pass
+
+        def _genres():
+            cats = cp.get("categories")
+            if isinstance(cats, (list, tuple)):
+                out["genres"] = [str(c).strip() for c in cats if str(c).strip()]
+        _try(_genres)
+
+        def _year():
+            d = str(cp.get("date") or "").strip()
+            m = re.search(r"(19|20)\d{2}", d)
+            if m:
+                out["year"] = m.group(0)
+        _try(_year)
+
+        def _country():
+            c = cp.get("country")
+            if isinstance(c, str) and c.strip():
+                out["country"] = c.strip()
+        _try(_country)
+
+        def _rating():
+            # star_ratings: [{'value': '8/10', 'system': 'themoviedb.org'}]
+            srs = cp.get("star_ratings")
+            if not isinstance(srs, (list, tuple)):
+                return
+            for sr in srs:
+                if not isinstance(sr, dict):
+                    continue
+                val = str(sr.get("value") or "").strip()
+                m = re.match(r"^\s*([\d.]+)\s*/\s*([\d.]+)\s*$", val)
+                if not m:
+                    continue
+                num, den = float(m.group(1)), float(m.group(2))
+                if den > 0:
+                    # Normalise to /10, which is what Kodi expects.
+                    out["rating_value"] = round(num * 10.0 / den, 1)
+                    out["rating_system"] = str(sr.get("system") or "").strip()
+                    return
+        _try(_rating)
+
+        def _credits():
+            # credits: {'actor': [{'name': 'Mike Greenberg'}], 'director': [...]}
+            cr = cp.get("credits")
+            if not isinstance(cr, dict):
+                return
+            for role in ("actor", "director", "writer", "presenter", "guest"):
+                people = cr.get(role)
+                if not isinstance(people, (list, tuple)):
+                    continue
+                names = []
+                for person in people:
+                    if isinstance(person, dict):
+                        n = str(person.get("name") or "").strip()
+                    else:
+                        n = str(person).strip()
+                    if n:
+                        names.append(n)
+                if names:
+                    out["credits"][role] = names
+        _try(_credits)
+
+        def _uniqueid():
+            t = str(cp.get("thetvdb.com_id") or "").strip()
+            if t:
+                # 'series/260092' -> 260092
+                out["tvdb"] = t.rsplit("/", 1)[-1]
+        _try(_uniqueid)
+
+        def _flags():
+            # Not standard NFO elements, so they land as <tag>. They are the
+            # first-run/repeat signal, which is exactly what distinguishes an
+            # airing with a real synopsis from one carrying the show blurb.
+            for key, tag in (("new", "New"), ("premiere", "Premiere"),
+                            ("live", "Live"), ("previously_shown", "Repeat")):
+                if cp.get(key):
+                    out["tags"].append(tag)
+            kws = cp.get("keywords")
+            if isinstance(kws, (list, tuple)):
+                out["tags"].extend(str(k).strip() for k in kws if str(k).strip())
+        _try(_flags)
+
+        def _icon():
+            ic = cp.get("icon")
+            if isinstance(ic, str) and ic.startswith("http"):
+                out["icon"] = ic
+        _try(_icon)
+
+        return out
 
     def _episode_nfo(self, plan):
         root = ET.Element("episodedetails")
@@ -681,8 +1058,43 @@ class Plugin:
         _text(root, "plot", plan["plot"])
         _text(root, "aired", plan["aired"])
         _text(root, "mpaa", plan["rating"])
+
+        # --- EPG detail that was previously discarded -----------------------
+        x = plan.get("extra") or {}
+        for g in x.get("genres", []):
+            _text(root, "genre", g)
+        if x.get("year"):
+            _text(root, "year", x["year"])
+        if x.get("country"):
+            _text(root, "country", x["country"])
+        if x.get("rating_value") is not None:
+            # <ratings><rating name=..><value/></rating></ratings> is the modern
+            # Kodi shape; the flat <rating> is kept too because Plex reads it.
+            ratings = ET.SubElement(root, "ratings")
+            r = ET.SubElement(ratings, "rating",
+                              {"name": x.get("rating_system") or "epg",
+                               "max": "10"})
+            _text(r, "value", x["rating_value"])
+            _text(root, "rating", x["rating_value"])
+        for role, names in (x.get("credits") or {}).items():
+            # Kodi: <actor><name/></actor>; everything else is a flat element.
+            for n in names:
+                if role == "actor":
+                    a = ET.SubElement(root, "actor")
+                    _text(a, "name", n)
+                else:
+                    _text(root, role, n)
+        if x.get("tvdb"):
+            ET.SubElement(root, "uniqueid", {"type": "tvdb"}).text = str(x["tvdb"])
+        for t in dict.fromkeys(x.get("tags", [])):     # de-duped, order kept
+            _text(root, "tag", t)
+
+        # A LOCAL thumbnail always wins: it is a frame of this actual recording,
+        # whereas the EPG icon is promotional art for the programme.
         if os.path.exists(plan["thumb"]):
             _text(root, "thumb", os.path.basename(plan["thumb"]))
+        elif x.get("icon"):
+            _text(root, "thumb", x["icon"])
         return _pretty(root)
 
     def _tvshow_nfo(self, plan):
@@ -991,6 +1403,84 @@ class Plugin:
 
     # ------------------------------------------------------- deferred waiter
 
+    def _capture_epg_at_start(self, recording_id, log):
+        """Write the EPG's episode name into the recording, at start.
+
+        The counterpart to _fresh_sub_title, one step earlier: rather than
+        re-reading the EPG when the NFO is written and hoping the row survives,
+        this pins the answer into the recording while the programme is ON AIR
+        and the row cannot have aged out.
+
+        Deliberately narrow:
+        - Only fills sub_title, and only when it is ABSENT. A name that was
+          already known at scheduling time is correct and is left alone; this
+          must never overwrite good data with a window match.
+        - Never raises. A metadata nicety must not affect a recording, so every
+          failure is logged and swallowed.
+        - close_old_connections() in `finally`, the pattern the end-handler
+          established in this same container -- a daemon thread that keeps a
+          connection open outlives the request that would have closed it.
+        """
+        from django.db import close_old_connections, transaction
+
+        from apps.channels.models import Recording
+
+        try:
+            # --- read phase: decide whether there is anything to do, and do the
+            # EPG lookup, OUTSIDE any lock. The query is the slow part and it
+            # touches a different table; holding a row lock across it would put
+            # this thread in the way of the recording task for no reason.
+            rec = Recording.objects.filter(id=recording_id).first()
+            if rec is None:
+                log.info("[%s] recording %s vanished before EPG capture", PLUGIN_KEY, recording_id)
+                return
+            prog = (rec.custom_properties or {}).get("program") or {}
+            existing = (prog.get("sub_title") or "").strip()
+            if existing and existing.lower() != "unknown":
+                return                      # already named; nothing to do
+
+            fresh = self._fresh_sub_title(prog, log)
+            if not fresh:
+                log.info("[%s] recording %s: EPG has no episode name at start",
+                         PLUGIN_KEY, recording_id)
+                return
+
+            # --- write phase: re-read UNDER A ROW LOCK and merge into whatever
+            # custom_properties holds NOW.
+            #
+            # ⛔ custom_properties is a single JSON blob that the recording task
+            # is actively writing during start-up (status, file_path). A plain
+            # read-modify-write from this thread would save a dict captured
+            # BEFORE those updates and silently revert them -- and the loss would
+            # be invisible, because the field would still look well-formed.
+            # Re-reading inside the lock means we only ever add one key to the
+            # current value.
+            with transaction.atomic():
+                locked = Recording.objects.select_for_update().filter(id=recording_id).first()
+                if locked is None:
+                    return
+                cp = locked.custom_properties or {}
+                prog_now = cp.get("program") or {}
+                # Re-check under the lock: another writer may have supplied the
+                # name while the EPG query was running.
+                again = (prog_now.get("sub_title") or "").strip()
+                if again and again.lower() != "unknown":
+                    return
+                prog_now["sub_title"] = fresh
+                cp["program"] = prog_now
+                # Provenance, so a later reader can tell a captured name from one
+                # that was in the original snapshot.
+                cp["clapparr_sub_title_source"] = "epg_at_start"
+                locked.custom_properties = cp
+                locked.save(update_fields=["custom_properties"])
+            log.info("[%s] recording %s: captured episode name %r from the EPG",
+                     PLUGIN_KEY, recording_id, fresh)
+        except Exception as e:  # noqa: BLE001
+            log.warning("[%s] EPG capture failed for recording %s: %r",
+                        PLUGIN_KEY, recording_id, e)
+        finally:
+            close_old_connections()
+
     def _wait_and_emit(self, recording_id, cfg, log):
         """Wait for the remux, then write sidecars. Runs on its own thread.
 
@@ -1037,6 +1527,31 @@ class Plugin:
         log = context.get("logger")
         cfg = self._settings(context)
         params = params or {}
+
+        if action == "on_recording_start":
+            # ⭐ WHY AT START, not only at the end.
+            # custom_properties["program"] is snapshotted when the recording is
+            # SCHEDULED -- often days before broadcast, before the provider has
+            # named the episode. That stale snapshot is why _episode_title fell
+            # back to a date ("Wednesday 26 August 2026") while the plot, which
+            # IS re-read, came out correct. Capturing here fixes the snapshot at
+            # source rather than compensating for it later.
+            if not cfg["auto"]:
+                return {"status": "skipped", "message": "Automatic generation is disabled"}
+            payload = params.get("payload") or {}
+            rid = payload.get("recording_id") or payload.get("recordingId")
+            if not rid:
+                return {"status": "skipped", "message": "Event carried no recording_id"}
+            # ⛔ Same hard rule as on_recording_end: dispatcharr runs this handler
+            # SYNCHRONOUSLY, inline with the recording task, so it must not block.
+            # The work is two queries, but it takes the thread anyway -- an
+            # inline DB write on the task that is opening the stream is not worth
+            # the risk, and the symmetry keeps one pattern rather than two.
+            threading.Thread(
+                target=self._capture_epg_at_start, args=(rid, log),
+                name=f"{PLUGIN_KEY}-start-{rid}", daemon=True,
+            ).start()
+            return {"status": "ok", "message": f"Queued EPG capture for recording {rid}"}
 
         if action == "on_recording_end":
             if not cfg["auto"]:
