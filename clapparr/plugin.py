@@ -245,7 +245,7 @@ def _duration(path):
 
 class Plugin:
     name = "Clapparr"
-    version = "1.3.0"
+    version = "1.4.1"
     description = (
         "The metadata slate for your DVR: writes Kodi/Plex NFO sidecars, "
         "posters and episode thumbnails so recordings present with real "

@@ -5,6 +5,15 @@ All notable changes to Clapparr are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 Clapparr adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.1] — 2026-08-28
+
+### Fixed
+
+- **The plugin reported its version as 1.3.0.** `Plugin.version` in `plugin.py`
+  was not bumped for the 1.4.0 release, and that attribute is what Dispatcharr
+  displays, so the UI showed 1.3.0 for a 1.4.0 plugin. The manifest and this
+  changelog were correct; only the value the user actually sees was wrong.
+
 ## [1.4.0] — 2026-08-27
 
 ### Added
@@ -94,6 +103,7 @@ Clapparr adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Initial release as *DVR NFO Generator* for Dispatcharr: Kodi/Plex NFO
   sidecars, posters and episode thumbnails for DVR recordings.
 
+[1.4.1]: https://github.com/v8eta/clapparr/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/v8eta/clapparr/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/v8eta/clapparr/compare/v1.2.1...v1.3.0
 [1.2.1]: https://github.com/v8eta/clapparr/compare/v1.2.0...v1.2.1
