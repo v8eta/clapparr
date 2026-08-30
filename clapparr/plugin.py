@@ -39,6 +39,7 @@ thread calls `close_old_connections()` in its own `finally` block, as the same
 documentation requires of any thread a plugin spawns that touches the ORM.
 """
 
+import glob
 import json
 import os
 import re
@@ -1374,7 +1375,28 @@ class Plugin:
 
         # Thumbnail first: the episode NFO references it only if it exists.
         if cfg["thumb_mode"] != "off":
-            if cfg["overwrite"] or not os.path.exists(plan["thumb"]):
+            # ⛔ Defer to an EXTERNAL OWNER that has already chosen this
+            # thumbnail. clapparr fires at recording_end, before any ad-break
+            # analysis exists, so its own pick is a position heuristic that can
+            # land inside a commercial -- correct as a placeholder, wrong as a
+            # replacement for something better chosen later. `overwrite`
+            # deliberately does NOT override this.
+            #
+            # ⭐ Written generically -- any "<base>-thumb.<owner>.json" claims
+            # it -- rather than naming breakarr. This is a reasonable upstream
+            # feature that carries no estate-specific knowledge, which matters
+            # because a clapparr update would otherwise silently revert a local
+            # patch and the protection would vanish with no signal.
+            #
+            # ⚠️ Derived from plan["mkv"] (the original recording path) by the
+            # SAME route _plan() used to build plan["thumb"] itself, not by
+            # string surgery on plan["thumb"]. Two derivations of one path is
+            # how they drift. (This plugin's plan dict has no "path" key --
+            # the recording path is stored under "mkv".)
+            _stem = os.path.splitext(plan["mkv"])[0]
+            _owned = glob.glob(_stem + "-thumb.*.json")
+            if not _owned and (cfg["overwrite"]
+                               or not os.path.exists(plan["thumb"])):
                 wrote["thumb"] = self._make_thumb(plan, cfg, log)
 
         wrote["nfo"] = _write(plan["nfo"], self._episode_nfo(plan), cfg["overwrite"])

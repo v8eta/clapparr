@@ -156,7 +156,9 @@ Set this off if you would rather have no poster than a possibly wrong one.
 `representative` hands ffmpeg's `thumbnail` filter a batch of frames and takes the one most representative of the batch, which keeps it off fades and hard cuts. The sample point stays clear of the opening minutes and the final tenth of the file.
 
 > [!TIP]
-> If you run a commercial-detection pass that **cuts** recordings afterwards, consider setting thumbnails to `off` and generating them from the cut file instead. This plugin runs when the recording ends — before any such pass — so a mid-file frame can land inside an ad break.
+> If you run a commercial-detection pass that **cuts** recordings afterwards, a thumbnail taken here can land inside an ad break: this plugin runs when the recording ends, before any such pass.
+>
+> Since **1.5.0** you no longer have to turn thumbnails `off` to avoid that. A cutter can claim a recording's thumbnail by writing an ownership marker beside it — a `<recording>-thumb.<owner>.json` sidecar — and this plugin then skips that recording instead of racing the cutter for the same `-thumb.jpg`. Without a marker nothing changes, so existing setups are unaffected.
 
 ## Timing
 
