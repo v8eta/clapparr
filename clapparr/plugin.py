@@ -350,7 +350,13 @@ def _duration(path):
 
 class Plugin:
     name = "Clapparr"
-    version = "1.4.1"
+    # ⚠️ Must match plugin.json's "version". Dispatcharr reads THIS constant for
+    # what it displays, while the catalog reads plugin.json -- so a drift shows
+    # users one version and tells the installer another. It drifted silently for
+    # two releases (v1.5.0 and v1.6.0 both still shipped "1.4.1", including
+    # inside their zips) because nothing compared the two. test_version_sync.py
+    # now does; do not bump one without the other.
+    version = "1.6.0"
     description = (
         "The metadata slate for your DVR: writes Kodi/Plex NFO sidecars, "
         "posters and episode thumbnails so recordings present with real "
