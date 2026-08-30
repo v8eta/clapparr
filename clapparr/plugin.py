@@ -167,6 +167,110 @@ def _fuzzy_show_match(title, results, min_coverage, country):
     )
 
 
+# --- RPDB (Rating Poster Database) -----------------------------------------
+# OPTIONAL, and entirely off unless an API key is set. https://rpdb.apidoc.io
+#
+# The API is keyed on an IMDB / TMDB / TVDB id and returns the show poster with
+# the rating rendered onto it. `?fallback=true` is not optional in practice:
+# without it the API returns an ERROR for any title it holds no ratings for,
+# which for regional and news programming is most of them. With it, such a title
+# still yields a plain poster, so enabling RPDB can never leave a show with less
+# artwork than it had.
+_RPDB_BASE = "https://api.ratingposterdb.com"
+_RPDB_TYPES = ("poster-default", "poster-certs", "poster-mc", "poster-rt",
+               "textless-default", "textless-certs", "textless-mc",
+               "textless-rt")
+
+# A poster is portrait. Anything wider than it is tall is a banner or an episode
+# still that a provider filed under the poster key, and Plex will letterbox it
+# into a poster slot. Below _MIN it is a thumbnail and not worth writing; at or
+# above _GOOD it is good enough to stop looking rather than spend another fetch.
+_POSTER_MIN_W = 200
+_POSTER_GOOD_W = 600
+
+
+def _rm(path):
+    """Delete if present. Cleanup must never mask the error that caused it."""
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _tvdb_id(custom_props):
+    """TVDB series id from an EPG row, or "".
+
+    ⭐ ONE derivation, two callers -- the NFO `uniqueid` element and the RPDB
+    URL. The EPG stores it as 'series/260092' and both callers need the bare
+    number. Deriving it separately in each place is exactly how two routes to
+    one value drift apart later.
+    """
+    raw = str((custom_props or {}).get("thetvdb.com_id") or "").strip()
+    return raw.rsplit("/", 1)[-1] if raw else ""
+
+
+def _image_dims(path):
+    """(width, height) of a JPEG or PNG, or None if it is neither/unreadable.
+
+    Header only, stdlib only. Deliberately NOT Pillow: this plugin has no image
+    dependency today and should not acquire one to read two integers. Reads a
+    few KB at most and never decodes pixels.
+    """
+    try:
+        with open(path, "rb") as fh:
+            if fh.read(2) == b"\xff\xd8":                     # JPEG
+                while True:
+                    b = fh.read(1)
+                    while b and b != b"\xff":
+                        b = fh.read(1)
+                    if not b:
+                        return None
+                    marker = fh.read(1)
+                    while marker == b"\xff":                   # fill bytes
+                        marker = fh.read(1)
+                    if not marker:
+                        return None
+                    m = marker[0]
+                    if m in (0xD8, 0x01) or 0xD0 <= m <= 0xD7:  # no length field
+                        continue
+                    # SOF0..SOF15 carry the dimensions; DHT/JPG/DAC do not.
+                    if 0xC0 <= m <= 0xCF and m not in (0xC4, 0xC8, 0xCC):
+                        fh.read(3)                             # length, precision
+                        h = int.from_bytes(fh.read(2), "big")
+                        w = int.from_bytes(fh.read(2), "big")
+                        return (w, h) if w and h else None
+                    seg = int.from_bytes(fh.read(2), "big")
+                    if seg < 2:
+                        return None
+                    fh.seek(seg - 2, 1)
+            fh.seek(0)
+            if fh.read(8) == b"\x89PNG\r\n\x1a\n":             # PNG IHDR
+                fh.seek(16)
+                w = int.from_bytes(fh.read(4), "big")
+                h = int.from_bytes(fh.read(4), "big")
+                return (w, h) if w and h else None
+    except Exception:
+        return None
+    return None
+
+
+def _poster_grade(path):
+    """(ok, width, why) for a downloaded poster candidate.
+
+    Portrait-or-square and wide enough. A landscape image is rejected outright
+    rather than written and left for a human to notice in Plex months later.
+    """
+    dims = _image_dims(path)
+    if not dims:
+        return False, 0, "not a readable JPEG/PNG"
+    w, h = dims
+    if w > h:
+        return False, w, "landscape %dx%d (a poster is portrait)" % (w, h)
+    if w < _POSTER_MIN_W:
+        return False, w, "only %dpx wide" % w
+    return True, w, "%dx%d" % (w, h)
+
+
 def _text(parent, tag, value):
     """Append <tag>value</tag> when value is meaningful. Skips None/blank."""
     if value is None:
@@ -320,6 +424,35 @@ class Plugin:
                 "Breaks ties between identically named shows — TVmaze lists an "
                 "AU and a US 'Highway Patrol'. Left blank, such a tie is "
                 "rejected as ambiguous rather than guessed."
+            ),
+        },
+        {
+            "id": "rpdb_api_key",
+            "label": "RPDB API key",
+            "type": "string",
+            "default": "",
+            "input_type": "password",
+            "description": (
+                "Optional, and off while blank. With a key, the show poster is "
+                "fetched from the Rating Poster Database "
+                "(https://ratingposterdb.com) with the rating rendered onto it. "
+                "Needs a paid RPDB subscription; keys look like 't1-…'. One "
+                "request per show, and the poster is written once and reused, "
+                "so a whole library costs very few requests. If RPDB has no "
+                "artwork for a show, the normal poster sources are used instead."
+            ),
+        },
+        {
+            "id": "rpdb_poster_type",
+            "label": "RPDB poster style",
+            "type": "string",
+            "default": "poster-default",
+            "description": (
+                "poster-default, poster-certs, poster-mc, poster-rt, or any of "
+                "those with a 'textless-' prefix, which prefers artwork without "
+                "the show title burned in. The lowest RPDB tier supports only "
+                "poster-default; higher tiers support all eight. An unrecognised "
+                "value falls back to poster-default. Ignored with no API key."
             ),
         },
         {
@@ -568,7 +701,11 @@ class Plugin:
     def __init__(self):
         # One TVmaze answer per show name per process, negatives included, so a
         # bulk regenerate over 30 recordings of the same show is a single call.
-        self._poster_cache = {}
+        # title -> matched TVmaze show dict, or None if nothing matched. One
+        # cache, because artwork and external ids come from the SAME match:
+        # resolving them separately could pair one show's poster with another
+        # show's ratings.
+        self._tvmaze_cache = {}
         # Same idea for Plex show ratingKeys.
         self._plex_key_cache = {}
         # A bulk regenerate touches every episode of a show, but the show only
@@ -608,6 +745,14 @@ class Plugin:
             "webhook_header": (s.get("webhook_header") or "").strip(),
             "plex_url": (s.get("plex_url") or "").strip().rstrip("/"),
             "plex_token": (s.get("plex_token") or "").strip(),
+            # Blank key = RPDB disabled entirely; no request is ever made.
+            "rpdb_key": (s.get("rpdb_api_key") or "").strip(),
+            # An unrecognised style degrades to the one every tier supports,
+            # rather than 404ing on every show until someone reads a log.
+            "rpdb_type": (
+                (s.get("rpdb_poster_type") or "").strip()
+                if (s.get("rpdb_poster_type") or "").strip() in _RPDB_TYPES
+                else "poster-default"),
         }
 
     def _fresh_sub_title(self, prog, log=None):
@@ -883,6 +1028,8 @@ class Plugin:
                      or (prog.get("description") or "").strip()),
             "rating": cp.get("rating"),
             "poster_url": cp.get("poster_url"),
+            # Same derivation the NFO uniqueid uses; RPDB is keyed on it.
+            "tvdb": _tvdb_id(cp),
             # ⭐ Everything below was already sitting in the row we had fetched.
             # Reading it costs one dict lookup each -- the query is the expensive
             # part and it had already happened. The EPG was carrying 21 keys that
@@ -1021,10 +1168,9 @@ class Plugin:
         _try(_credits)
 
         def _uniqueid():
-            t = str(cp.get("thetvdb.com_id") or "").strip()
+            t = _tvdb_id(cp)          # 'series/260092' -> '260092'
             if t:
-                # 'series/260092' -> 260092
-                out["tvdb"] = t.rsplit("/", 1)[-1]
+                out["tvdb"] = t
         _try(_uniqueid)
 
         def _flags():
@@ -1152,8 +1298,14 @@ class Plugin:
         log.debug("[%s] thumbnail failed for %s", PLUGIN_KEY, mkv)
         return False
 
-    def _tvmaze_poster(self, show_title, cfg, log):
+    def _tvmaze_show(self, show_title, cfg, log):
         """Fuzzy TVmaze lookup for a show Dispatcharr could not resolve exactly.
+
+        Returns the matched show dict (or None). The caller picks what it needs
+        from it: `image` for artwork, `externals` for IMDB/TVDB ids. One lookup
+        serves both because they must describe the same show -- and TVmaze
+        returns the ids in the response the artwork already required, so the
+        ids cost nothing extra.
 
         TVmaze's search does not degrade gracefully on a variant title: querying
         "Highway Patrol Special" returns ZERO results, while "Highway Patrol"
@@ -1164,8 +1316,8 @@ class Plugin:
         full original title, so a shorter query cannot widen what is accepted --
         it only changes where we look.
         """
-        if show_title in self._poster_cache:
-            return self._poster_cache[show_title]
+        if show_title in self._tvmaze_cache:
+            return self._tvmaze_cache[show_title]
 
         import urllib.parse
         import urllib.request
@@ -1176,7 +1328,7 @@ class Plugin:
             for n in range(len(words), _FUZZY_MIN_WORDS - 1, -1)
         ][:_FUZZY_MAX_QUERIES]
 
-        url = None
+        match = None
         reason = "no query returned a usable candidate"
         for i, q in enumerate(queries):
             try:
@@ -1198,40 +1350,166 @@ class Plugin:
                 show_title, results, cfg["fuzzy_coverage"], cfg["country"]
             )
             if show:
-                image = show.get("image") or {}
-                url = image.get("original") or image.get("medium")
+                match = show
                 reason = "query %r %s" % (q, why)
                 break
             reason = "query %r %s" % (q, why)
 
         log.info("[%s] artwork fallback for %r: %s", PLUGIN_KEY, show_title, reason)
-        self._poster_cache[show_title] = url
-        return url
+        self._tvmaze_cache[show_title] = match
+        return match
+
+    def _tvmaze_poster(self, show_title, cfg, log):
+        """Poster URL from the fuzzy TVmaze match, or None.
+
+        `original` before `medium`: medium is roughly 210px wide, which is a
+        thumbnail, and a poster written once and kept for years should not be
+        the small one when the large one costs the same request.
+        """
+        image = (self._tvmaze_show(show_title, cfg, log) or {}).get("image") or {}
+        return image.get("original") or image.get("medium")
+
+    def _tvmaze_ids(self, show_title, cfg, log):
+        """{"tvdb": str, "imdb": str} from the fuzzy TVmaze match; values may be "".
+
+        The same guarded match the artwork uses -- coverage threshold, country
+        tie-break, ambiguity refused -- so an id can only come from a show this
+        plugin was already willing to take a poster from. That matters: a wrong
+        id here would fetch a confidently wrong poster for the wrong series.
+        """
+        ext = (self._tvmaze_show(show_title, cfg, log) or {}).get("externals") or {}
+        return {"tvdb": str(ext.get("thetvdb") or "").strip(),
+                "imdb": str(ext.get("imdb") or "").strip()}
+
+    def _rpdb_url(self, plan, cfg, log):
+        """RPDB poster URL for this show, or None when no id can be resolved.
+
+        Id resolution, cheapest first:
+
+          1. the TVDB id the EPG already carries      -- free, no request
+          2. TVDB id from the fuzzy TVmaze match      -- cached, and the same
+             request the artwork fallback already makes
+          3. IMDB id from that same match             -- RPDB takes `tt…` bare
+
+        ⭐ TMDB is deliberately NOT consulted. Its /find endpoint resolves the
+        same shows by external id, but it needs its own API key, and TVmaze
+        already returns both ids in the response the artwork lookup fetches. A
+        second credential for overlapping coverage is a poor trade in a plugin
+        whose whole point is that it works with what Dispatcharr already has.
+
+        The ids come from the SAME guarded match the artwork uses -- coverage
+        threshold, country tie-break, ambiguity refused -- so RPDB can only be
+        asked about a show this plugin already trusts. A wrong id here would
+        return a confidently wrong poster for a different series, which is worse
+        than no poster.
+        """
+        if not cfg["rpdb_key"]:
+            return None
+
+        id_type = media_id = ""
+        if plan.get("tvdb"):
+            id_type, media_id = "tvdb", "series-%s" % plan["tvdb"]
+        elif cfg["fuzzy"]:
+            ids = self._tvmaze_ids(plan["show"], cfg, log)
+            if ids["tvdb"]:
+                id_type, media_id = "tvdb", "series-%s" % ids["tvdb"]
+            elif ids["imdb"]:
+                # An IMDB id is used bare; the movie-/series- prefix is a
+                # TMDB/TVDB requirement only.
+                id_type, media_id = "imdb", ids["imdb"]
+        if not id_type:
+            return None
+
+        import urllib.parse
+
+        return "%s/%s/%s/%s/%s.jpg?fallback=true" % (
+            _RPDB_BASE,
+            urllib.parse.quote(cfg["rpdb_key"], safe=""),
+            id_type,
+            cfg["rpdb_type"],
+            urllib.parse.quote(media_id, safe=""),
+        )
+
+    def _download(self, url, tmp):
+        import urllib.request
+
+        req = urllib.request.Request(url, headers={"User-Agent": "Dispatcharr-NFO"})
+        with urllib.request.urlopen(req, timeout=30) as r, open(tmp, "wb") as fh:
+            shutil.copyfileobj(r, fh)
+        return os.path.getsize(tmp) > 0
 
     def _fetch_poster(self, plan, cfg, log):
+        """Write <show>/poster.jpg from the best source that yields a real poster.
+
+        Sources are tried in preference order and each is GRADED after download.
+        A landscape image is refused outright: providers do file banners and
+        episode stills under the poster key, and Plex will letterbox one into a
+        poster slot where it looks broken for as long as nobody notices.
+
+        The first candidate at or above _POSTER_GOOD_W wins immediately;
+        otherwise the widest valid candidate is kept. That is the difference
+        between artwork chosen on quality and artwork chosen on precedence -- a
+        416px provider thumbnail should not beat a 680px TVmaze original just
+        because it was consulted first.
+
+        Candidate URLs resolve lazily, so a good first source still costs
+        exactly one request and TVmaze is not consulted at all.
+        """
         dest = os.path.join(plan["dir"], "poster.jpg")
         if os.path.exists(dest) and not cfg["overwrite"]:
             return False
-        url = plan.get("poster_url")
-        if not url and cfg["fuzzy"]:
-            # Dispatcharr found nothing for this title; try the fuzzy endpoint.
-            url = self._tvmaze_poster(plan["show"], cfg, log)
-        if not url:
-            return False
-        try:
-            import urllib.request
 
-            tmp = dest + ".tmp"
-            req = urllib.request.Request(url, headers={"User-Agent": "Dispatcharr-NFO"})
-            with urllib.request.urlopen(req, timeout=30) as r, open(tmp, "wb") as fh:
-                shutil.copyfileobj(r, fh)
-            if os.path.getsize(tmp) > 0:
-                os.replace(tmp, dest)
+        cands = []
+        if cfg["rpdb_key"]:
+            cands.append(("rpdb", lambda: self._rpdb_url(plan, cfg, log)))
+        if plan.get("poster_url"):
+            cands.append(("epg", lambda: plan["poster_url"]))
+        if cfg["fuzzy"]:
+            cands.append(("tvmaze",
+                          lambda: self._tvmaze_poster(plan["show"], cfg, log)))
+        if not cands:
+            return False
+
+        tmp, best = dest + ".tmp", None
+        try:
+            for source, resolve in cands:
+                try:
+                    url = resolve()
+                    if not url or not self._download(url, tmp):
+                        continue
+                except Exception as e:
+                    # ⚠️ NEVER log the url for the rpdb source -- it embeds the
+                    # API key. The source label is enough to diagnose with.
+                    log.debug("[%s] poster fetch failed (%s): %s",
+                              PLUGIN_KEY, source, e)
+                    continue
+                ok, width, why = _poster_grade(tmp)
+                if not ok:
+                    log.info("[%s] %s poster refused for %r: %s",
+                             PLUGIN_KEY, source, plan["show"], why)
+                    continue
+                if width >= _POSTER_GOOD_W:
+                    os.replace(tmp, dest)
+                    _match_dir_owner(dest)
+                    log.info("[%s] poster from %s for %r (%s)",
+                             PLUGIN_KEY, source, plan["show"], why)
+                    return True
+                if best is None or width > best[0]:
+                    if best:
+                        _rm(best[1])
+                    keep = dest + ".cand"
+                    os.replace(tmp, keep)
+                    best = (width, keep, source)
+            if best:
+                os.replace(best[1], dest)
                 _match_dir_owner(dest)
+                log.info("[%s] poster from %s for %r (%dpx; no wider source "
+                         "available)", PLUGIN_KEY, best[2], plan["show"], best[0])
                 return True
-            os.remove(tmp)
-        except Exception as e:
-            log.debug("[%s] poster fetch failed (%s): %s", PLUGIN_KEY, url, e)
+        finally:
+            _rm(tmp)
+            if best:
+                _rm(best[1])
         return False
 
     def _plex(self, cfg, path, method="GET"):
@@ -1394,7 +1672,13 @@ class Plugin:
             # how they drift. (This plugin's plan dict has no "path" key --
             # the recording path is stored under "mkv".)
             _stem = os.path.splitext(plan["mkv"])[0]
-            _owned = glob.glob(_stem + "-thumb.*.json")
+            # ⚠️ glob.escape: a show title containing [ ] is read as a character
+            # class, the pattern then matches NOTHING, and the ownership check
+            # silently reports "unowned" -- so the cutter's thumbnail gets
+            # overwritten by exactly the protection meant to prevent it. Failing
+            # open is the wrong direction for a guard. ("Doctor Who [2005]"
+            # reproduced this; a literal ? or * happens to still self-match.)
+            _owned = glob.glob(glob.escape(_stem) + "-thumb.*.json")
             if not _owned and (cfg["overwrite"]
                                or not os.path.exists(plan["thumb"])):
                 wrote["thumb"] = self._make_thumb(plan, cfg, log)

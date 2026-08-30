@@ -66,6 +66,8 @@ The NFO agent needs PMS **1.43.1 or newer** and is available to everyone — **n
 | Look up artwork on TVmaze when the recording has none | on | See *Artwork fallback* below |
 | Minimum title coverage for a fuzzy match | `0.6` | Raise toward `1.0` for near-exact names only |
 | Prefer shows from this country | *(blank)* | 2-letter code; breaks ties between identically named shows |
+| RPDB API key | *(blank)* | Optional; blank disables it entirely. See *Posters with ratings* below |
+| RPDB poster style | `poster-default` | `poster-*` / `textless-*`; unrecognised values fall back |
 | Thumbnail | representative | `off`, `fixed`, or `representative` |
 | Position through the recording | `40`% | Kept clear of the opening and closing minutes |
 | Skip the first N seconds | `150` | Avoids pre-roll, idents and opening titles |
@@ -151,6 +153,36 @@ Set this off if you would rather have no poster than a possibly wrong one.
 > [!NOTE]
 > A `poster.jpg` written *after* Plex last scanned that show only appears once that show's metadata is refreshed (`PUT /library/metadata/{ratingKey}/refresh?force=1`). A library-wide refresh issued *before* the file exists will not pick it up.
 
+### Posters with ratings (RPDB)
+
+Optional, and **off unless you set an API key**. With one, the show poster is fetched from the [Rating Poster Database](https://ratingposterdb.com) with the rating rendered onto the artwork. RPDB needs a paid subscription; keys look like `t1-…`, and the digit is the tier.
+
+RPDB is keyed on a TVDB or IMDB id, which is resolved cheapest-first:
+
+1. the **TVDB id the EPG already carries** — free, no request
+2. the **TVDB id from the TVmaze match** — the same lookup the artwork fallback already makes, and cached per show
+3. the **IMDB id from that same match**
+
+The ids come from the *same* guarded match the artwork uses, so RPDB is only ever asked about a show that already cleared every rule in **Artwork fallback** above. A wrong id would return a confidently wrong poster for a different series, which is worse than no poster at all.
+
+Requests are tiny: **one per show**, and the poster is written once and reused. A library of 50 shows costs 50 requests against a monthly allowance in the tens of thousands.
+
+`poster style` picks what RPDB renders — `poster-default`, `poster-certs`, `poster-mc`, `poster-rt`, or any of those prefixed `textless-`, which prefers artwork without the show title burned in (useful because Plex draws the title itself). The lowest tier supports only `poster-default`; an unrecognised value falls back to it rather than failing.
+
+> [!NOTE]
+> The request always sends `fallback=true`. Without it RPDB returns an *error* for any show it holds no ratings for — common for regional and news programming — and enabling RPDB could then leave a show with no artwork at all. With it, such a show still gets a plain poster.
+
+### Poster quality
+
+Whatever the source, a downloaded poster is checked before it is kept:
+
+- **landscape images are refused.** Providers do file banners and episode stills under the poster key, and Plex will letterbox one into a poster slot where it stays looking broken until somebody notices.
+- images under 200px wide are refused as thumbnails.
+
+Sources are tried in order — RPDB, then the EPG poster URL, then TVmaze — and the first candidate at least 600px wide wins immediately. If none reaches that, the **widest** valid one is kept rather than the first. That is the difference between artwork chosen on quality and artwork chosen on precedence: a 416px provider thumbnail should not beat a 680px TVmaze original just because it was consulted first.
+
+A good first source still costs exactly one request; later sources are only fetched if the earlier ones were poor or missing.
+
 ### Thumbnails
 
 `representative` hands ffmpeg's `thumbnail` filter a batch of frames and takes the one most representative of the batch, which keeps it off fades and hard cuts. The sample point stays clear of the opening minutes and the final tenth of the file.
@@ -183,10 +215,13 @@ Each file the plugin writes is therefore given the same ownership as the directo
 
 `test_ownership_plex.py` covers ownership matching and the Plex refresh, also offline.
 
+`test_poster_sources.py` covers id resolution, the RPDB URL and poster grading, offline and with no API key — including that a key is never required to run them, and that the header-only image sizer agrees with `ffprobe` on a real encoder's output rather than only on bytes the test wrote itself.
+
 ```bash
 python3 clapparr/test_fuzzy_match.py
 python3 clapparr/test_webhook.py
 python3 clapparr/test_ownership_plex.py
+python3 clapparr/test_poster_sources.py
 ```
 
 ## How much EPG data does it need?

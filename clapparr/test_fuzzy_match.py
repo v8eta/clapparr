@@ -146,12 +146,27 @@ print("  %-4s %-52s -> %s" % ("ok" if ok3 else "FAIL",
 PASS, FAIL = (PASS + 1, FAIL) if ok3 else (PASS, FAIL + 1)
 
 # the cache must serve the second call without another HTTP round trip
-before = dict(p._poster_cache)
+before = dict(p._tvmaze_cache)
 p._tvmaze_poster("Highway Patrol Special", cfg("AU"), _Log())
-ok4 = p._poster_cache == before
+ok4 = p._tvmaze_cache == before
 print("  %-4s %-52s -> %s" % ("ok" if ok4 else "FAIL",
                               "second lookup served from cache", ok4))
 PASS, FAIL = (PASS + 1, FAIL) if ok4 else (PASS, FAIL + 1)
+
+# The cache holds the matched SHOW, not just its poster URL, so the artwork and
+# the external ids used for RPDB can never come from two different matches.
+cached = p._tvmaze_cache.get("Highway Patrol Special") or {}
+ok5 = bool(cached.get("name")) and "externals" in cached
+print("  %-4s %-52s -> %s" % ("ok" if ok5 else "FAIL",
+                              "cache holds the show, with externals",
+                              cached.get("name")))
+PASS, FAIL = (PASS + 1, FAIL) if ok5 else (PASS, FAIL + 1)
+
+ids = p._tvmaze_ids("Highway Patrol Special", cfg("AU"), _Log())
+ok6 = isinstance(ids, dict) and set(ids) == {"tvdb", "imdb"}
+print("  %-4s %-52s -> %s" % ("ok" if ok6 else "FAIL",
+                              "ids come from that same cached match", ids))
+PASS, FAIL = (PASS + 1, FAIL) if ok6 else (PASS, FAIL + 1)
 
 print("\n  %d passed, %d failed" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)
